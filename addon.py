@@ -1293,64 +1293,55 @@ class BlenderMCPServer:
         existing_objects = set(bpy.data.objects)
 
         # Import the GLB file
-        bpy.ops.import_scene.gltf(filepath=filepath)
+        try:
+            bpy.ops.import_scene.gltf(filepath=filepath)
+        except Exception as e:
+            print(f"GLTF Import Error: {str(e)}")
+            return None
 
         # Ensure the context is updated
         bpy.context.view_layer.update()
 
         # Get all imported objects
-        imported_objects = list(set(bpy.data.objects) - existing_objects)
-        # imported_objects = [obj for obj in bpy.context.view_layer.objects if obj.select_get()]
+        imported_objects = [obj for obj in bpy.data.objects if obj not in existing_objects]
 
         if not imported_objects:
             print("Error: No objects were imported.")
-            return
+            return None
 
-        # Identify the mesh object
-        mesh_obj = None
-
-        if len(imported_objects) == 1 and imported_objects[0].type == 'MESH':
+        # Robust Mesh Identification: Find the largest mesh or the first mesh
+        mesh_objs = [obj for obj in imported_objects if obj.type == 'MESH']
+        
+        if not mesh_objs:
+            # Fallback: if no mesh, just take the first object (might be an empty)
             mesh_obj = imported_objects[0]
-            print("Single mesh imported, no cleanup needed.")
         else:
-            if len(imported_objects) == 2:
-                empty_objs = [i for i in imported_objects if i.type == "EMPTY"]
-                if len(empty_objs) != 1:
-                    print("Error: Expected an empty node with one mesh child or a single mesh object.")
-                    return
-                parent_obj = empty_objs.pop()
-                if len(parent_obj.children) == 1:
-                    potential_mesh = parent_obj.children[0]
-                    if potential_mesh.type == 'MESH':
-                        print("GLB structure confirmed: Empty node with one mesh child.")
+            # Pick the mesh with the most vertices (usually the main object)
+            mesh_obj = max(mesh_objs, key=lambda o: len(o.data.vertices))
 
-                        # Unparent the mesh from the empty node
-                        potential_mesh.parent = None
-
-                        # Remove the empty node
-                        bpy.data.objects.remove(parent_obj)
-                        print("Removed empty node, keeping only the mesh.")
-
-                        mesh_obj = potential_mesh
-                    else:
-                        print("Error: Child is not a mesh object.")
-                        return
-                else:
-                    print("Error: Expected an empty node with one mesh child or a single mesh object.")
-                    return
-            else:
-                print("Error: Expected an empty node with one mesh child or a single mesh object.")
-                return
+        # Cleanup: Remove all other imported objects that are not the main mesh
+        # and are not children of the main mesh
+        for obj in imported_objects:
+            if obj != mesh_obj and obj.type == 'EMPTY':
+                # Move children to scene root before deleting parent empty
+                for child in obj.children:
+                    if child in imported_objects:
+                        child.parent = None
+                
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                except:
+                    pass
 
         # Rename the mesh if needed
         try:
-            if mesh_obj and mesh_obj.name is not None and mesh_name:
+            if mesh_obj and mesh_name:
                 mesh_obj.name = mesh_name
-                if mesh_obj.data.name is not None:
+                if mesh_obj.type == 'MESH' and mesh_obj.data:
                     mesh_obj.data.name = mesh_name
-                print(f"Mesh renamed to: {mesh_name}")
+                print(f"Imported asset processed and named: {mesh_name}")
         except Exception as e:
-            print("Having issue with renaming, give up renaming.")
+            print(f"Renaming issue: {str(e)}")
 
         return mesh_obj
 
