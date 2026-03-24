@@ -241,16 +241,27 @@ def get_blender_connection():
 @telemetry_tool("get_scene_info")
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
-    """Get detailed information about the current Blender scene"""
+    """Get detailed information about the current Blender scene with selection awareness.
+    Includes active object, selected objects, object count, and cursor location."""
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_scene_info")
-
-        # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting scene info from Blender: {str(e)}")
-        return f"Error getting scene info: {str(e)}"
+        return f"Error: {str(e)}. Make sure Blender is open and the addon is running."
+
+@mcp.tool()
+def is_ready(ctx: Context) -> str:
+    """Check if the Blender connection is active and ready for commands."""
+    try:
+        blender = get_blender_connection()
+        # Ping blender with a simple command
+        blender.send_command("get_scene_info")
+        return "SUCCESS: Blender is connected and ready."
+    except Exception as e:
+        return f"FAILED: {str(e)}. Please click 'Connect to Claude' in the Blender Sidebar."
+
 
 @telemetry_tool("get_object_info")
 @mcp.tool()

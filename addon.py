@@ -102,6 +102,12 @@ class BlenderMCPServer:
                     client, address = self.socket.accept()
                     print(f"Connected to client: {address}")
 
+                    # Notify UI of connection
+                    def notify_connect():
+                        bpy.ops.blendermcp.report_info(message=f"Connected to Claude: {address[0]}")
+                        return None
+                    bpy.app.timers.register(notify_connect)
+
                     # Handle client in a separate thread
                     client_thread = threading.Thread(
                         target=self._handle_client,
@@ -207,37 +213,41 @@ class BlenderMCPServer:
                         except json.JSONDecodeError as exc:
                             # Differentiate between incomplete frames and malformed input
                             if decoded is not None:
+                                # Heuristic to determine if JSON is incomplete or just malformed
+                                # "Expecting value" at the very end usually means more data is needed
                                 is_incomplete = (
                                     exc.pos == len(decoded)
                                     or exc.msg.startswith("Unterminated string")
-                                    or exc.msg.startswith("Expecting value")
+                                    or (exc.msg.startswith("Expecting value") and exc.pos >= len(decoded.rstrip()))
                                 )
+                                
                                 if is_incomplete:
                                     # Incomplete JSON, wait for more data
                                     break
                                 
-                                # Malformed JSON
+                                # Malformed JSON - send error to client and reset
                                 print(f"Malformed JSON received: {str(exc)}")
                                 try:
                                     error_response = {"status": "error", "message": f"Invalid JSON command: {exc.msg}"}
                                     client.sendall(json.dumps(error_response).encode('utf-8'))
-                                except:
-                                    pass
-                                # Clear buffer to recover or break to close connection
+                                except socket.error as se:
+                                    print(f"Failed to send JSON error response: {str(se)}")
+                                
+                                # Clear buffer to recover
                                 buffer = b''
                                 return
                             break
                         except UnicodeDecodeError as exc:
                             if exc.reason == "unexpected end of data":
-                                # Partial UTF-8 sequence at the buffer end
+                                # Partial UTF-8 sequence at the buffer end, wait for more
                                 break
                             
-                            print("Invalid UTF-8 in command stream")
+                            print(f"Invalid UTF-8 in command stream: {str(exc)}")
                             try:
                                 error_response = {"status": "error", "message": "Invalid UTF-8 in command stream"}
                                 client.sendall(json.dumps(error_response).encode('utf-8'))
-                            except:
-                                pass
+                            except socket.error as se:
+                                print(f"Failed to send UTF8 error response: {str(se)}")
                             return
                             
                 except Exception as e:
@@ -255,6 +265,12 @@ class BlenderMCPServer:
             except:
                 pass
             print("Client handler stopped")
+            
+            # Notify UI of disconnection
+            def notify_disconnect():
+                bpy.ops.blendermcp.report_info(message="Claude disconnected")
+                return None
+            bpy.app.timers.register(notify_disconnect)
 
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
@@ -342,37 +358,39 @@ class BlenderMCPServer:
 
 
     def get_scene_info(self):
-        """Get information about the current Blender scene"""
+        """Get information about the current Blender scene with selection awareness"""
         try:
             print("Getting scene info...")
-            # Simplify the scene info to reduce data size
             scene_info = {
                 "name": bpy.context.scene.name,
+                "active_object": bpy.context.active_object.name if bpy.context.active_object else None,
+                "selected_objects": [obj.name for obj in bpy.context.selected_objects],
                 "object_count": len(bpy.context.scene.objects),
                 "objects": [],
                 "materials_count": len(bpy.data.materials),
+                "cursor_location": [bpy.context.scene.cursor.location.x, 
+                                   bpy.context.scene.cursor.location.y, 
+                                   bpy.context.scene.cursor.location.z],
             }
 
-            # Collect minimal object information (limit to first 10 objects)
+            # Collect minimal object information (limit to first 15 objects)
             for i, obj in enumerate(bpy.context.scene.objects):
-                if i >= 10:  # Reduced from 20 to 10
+                if i >= 15:
                     break
 
                 obj_info = {
                     "name": obj.name,
                     "type": obj.type,
-                    # Only include basic location data
+                    "is_selected": obj.select_get(),
                     "location": [round(float(obj.location.x), 2),
                                 round(float(obj.location.y), 2),
                                 round(float(obj.location.z), 2)],
                 }
                 scene_info["objects"].append(obj_info)
 
-            print(f"Scene info collected: {len(scene_info['objects'])} objects")
             return scene_info
         except Exception as e:
             print(f"Error in get_scene_info: {str(e)}")
-            traceback.print_exc()
             return {"error": str(e)}
 
     @staticmethod
@@ -492,21 +510,44 @@ class BlenderMCPServer:
             return {"error": str(e)}
 
     def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
-        # This is powerful but potentially dangerous - use with caution
+        """Execute arbitrary Blender Python code with context safety and output capture"""
         try:
-            # Create a local namespace for execution
-            namespace = {"bpy": bpy}
+            # Prepare namespace with common utilities
+            namespace = {
+                "bpy": bpy, 
+                "mathutils": mathutils,
+                "context": bpy.context
+            }
 
-            # Capture stdout during execution, and return it as result
+            # Capture stdout during execution
             capture_buffer = io.StringIO()
             with redirect_stdout(capture_buffer):
-                exec(code, namespace)
+                # Ensure we are in a valid state for common operators
+                if bpy.context.screen:
+                    exec(code, namespace)
+                else:
+                    # Fallback for background execution
+                    exec(code, namespace)
 
             captured_output = capture_buffer.getvalue()
+            
+            # Ensure UI updates if we modified the scene
+            if bpy.context.screen:
+                for area in bpy.context.screen.areas:
+                    area.tag_redraw()
+            
             return {"executed": True, "result": captured_output}
         except Exception as e:
-            raise Exception(f"Code execution error: {str(e)}")
+            # Context-safe error handling
+            error_msg = str(e)
+            print(f"Blender Execution Error: {error_msg}")
+            # If we're stuck in a sub-mode, try to return to OBJECT mode
+            try:
+                if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            except:
+                pass
+            return {"executed": False, "error": error_msg}
 
 
 
@@ -2538,6 +2579,104 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
         
         return {'FINISHED'}
 
+class BLENDERMCP_OT_ReportInfo(bpy.types.Operator):
+    bl_idname = "blendermcp.report_info"
+    bl_label = "Report Info"
+    bl_options = {'INTERNAL'}
+    message: bpy.props.StringProperty()
+
+    def execute(self, context):
+        self.report({'INFO'}, self.message)
+        return {'FINISHED'}
+
+class BLENDERMCP_OT_ReportError(bpy.types.Operator):
+    bl_idname = "blendermcp.report_error"
+    bl_label = "Report Error"
+    bl_options = {'INTERNAL'}
+    message: bpy.props.StringProperty()
+
+    def execute(self, context):
+        self.report({'ERROR'}, self.message)
+        return {'FINISHED'}
+
+class BLENDERMCP_PT_SetupPanel(bpy.types.Panel):
+    bl_label = "Setup Assistant"
+    bl_idname = "BLENDERMCP_PT_SetupPanel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'BlenderMCP'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        box = layout.box()
+        box.label(text="Step 1: Prerequisites", icon='CHECKMARK')
+        
+        # Check for requests module
+        try:
+            import requests
+            box.label(text="Python: 'requests' installed", icon='CHECKBOX_HLT')
+        except ImportError:
+            box.label(text="Python: 'requests' MISSING", icon='CHECKBOX_DEHLT')
+            box.operator("wm.url_open", text="How to fix").url = "https://github.com/ahujasid/blender-mcp#troubleshooting"
+
+        box.separator()
+        box.label(text="Step 2: Start Connection", icon='CHECKMARK')
+        if not scene.blendermcp_server_running:
+            box.operator("blendermcp.start_server", text="Connect to Claude", icon='PLAY')
+        else:
+            box.label(text="Addon Server: Running", icon='CHECKBOX_HLT')
+            
+        box.separator()
+        box.label(text="Step 3: App Config", icon='CHECKMARK')
+        
+        # OS-specific config help
+        import platform
+        os_type = platform.system()
+        
+        col = box.column(align=True)
+        col.label(text=f"Detected OS: {os_type}")
+        
+        if os_type == "Windows":
+            col.label(text="Claude Config Path:")
+            col.label(text="%APPDATA%\\Claude\\claude_desktop_config.json", icon='FILE_FOLDER')
+        else:
+            col.label(text="Claude Config Path:")
+            col.label(text="~/Library/Application Support/Claude/claude_desktop_config.json", icon='FILE_FOLDER')
+
+        box.separator()
+        box.operator("blendermcp.copy_config", text="Copy Config to Clipboard", icon='COPY_ID')
+
+class BLENDERMCP_OT_CopyConfig(bpy.types.Operator):
+    bl_idname = "blendermcp.copy_config"
+    bl_label = "Copy Config"
+    
+    def execute(self, context):
+        import platform
+        path = os.path.abspath(os.path.dirname(__file__))
+        # Escape backslashes for JSON
+        path_escaped = path.replace("\\", "\\\\")
+        
+        config_template = {
+            "mcpServers": {
+                "blender": {
+                    "command": "uv",
+                    "args": [
+                        "--directory",
+                        path_escaped,
+                        "run",
+                        "blender-mcp"
+                    ]
+                }
+            }
+        }
+        
+        context.window_manager.clipboard = json.dumps(config_template, indent=2)
+        self.report({'INFO'}, "Config copied! Paste it into your Claude Desktop config file.")
+        return {'FINISHED'}
+
 # Registration functions
 def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
@@ -2664,10 +2803,14 @@ def register():
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
     bpy.utils.register_class(BLENDERMCP_PT_Panel)
+    bpy.utils.register_class(BLENDERMCP_PT_SetupPanel)
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
+    bpy.utils.register_class(BLENDERMCP_OT_ReportInfo)
+    bpy.utils.register_class(BLENDERMCP_OT_ReportError)
+    bpy.utils.register_class(BLENDERMCP_OT_CopyConfig)
 
     print("BlenderMCP addon registered")
 
