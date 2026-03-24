@@ -293,6 +293,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     
     Returns the screenshot as an Image.
     """
+    temp_path = None
     try:
         blender = get_blender_connection()
         
@@ -316,14 +317,18 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
         with open(temp_path, 'rb') as f:
             image_bytes = f.read()
         
-        # Delete the temp file
-        os.remove(temp_path)
-        
         return Image(data=image_bytes, format="png")
         
     except Exception as e:
         logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
+    finally:
+        # CRITICAL: Always clean up the temp file
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
 
 
 @telemetry_tool("execute_blender_code")

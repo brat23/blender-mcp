@@ -556,7 +556,7 @@ class BlenderMCPServer:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
 
-            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS)
+            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS, timeout=30)
             if response.status_code == 200:
                 return {"categories": response.json()}
             else:
@@ -578,7 +578,7 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
-            response = requests.get(url, params=params, headers=REQ_HEADERS)
+            response = requests.get(url, params=params, headers=REQ_HEADERS, timeout=30)
             if response.status_code == 200:
                 # Limit the response size to avoid overwhelming Blender
                 assets = response.json()
@@ -598,7 +598,7 @@ class BlenderMCPServer:
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
         try:
             # First get the files information
-            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS)
+            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS, timeout=30)
             if files_response.status_code != 200:
                 return {"error": f"Failed to get asset files: {files_response.status_code}"}
 
@@ -618,7 +618,7 @@ class BlenderMCPServer:
                     # since Blender can't properly load HDR data directly from memory
                     with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                         # Download the file
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=30)
                         if response.status_code != 200:
                             return {"error": f"Failed to download HDRI: {response.status_code}"}
 
@@ -653,7 +653,37 @@ class BlenderMCPServer:
                         env_tex.location = (-400, 0)
                         env_tex.image = env_image
 
-                        # ... (color space logic) ...
+                        # Use a color space that exists in all Blender versions
+                        if file_format.lower() == 'exr':
+                            # Try to use Linear color space for EXR files
+                            try:
+                                env_tex.image.colorspace_settings.name = 'Linear'
+                            except:
+                                # Fallback to Non-Color if Linear isn't available
+                                env_tex.image.colorspace_settings.name = 'Non-Color'
+                        else:  # hdr
+                            # For HDR files, try these options in order
+                            for color_space in ['Linear', 'Linear Rec.709', 'Non-Color']:
+                                try:
+                                    env_tex.image.colorspace_settings.name = color_space
+                                    break  # Stop if we successfully set a color space
+                                except:
+                                    continue
+
+                        background = node_tree.nodes.new(type='ShaderNodeBackground')
+                        background.location = (-200, 0)
+
+                        output = node_tree.nodes.new(type='ShaderNodeOutputWorld')
+                        output.location = (0, 0)
+
+                        # Connect nodes
+                        node_tree.links.new(tex_coord.outputs['Generated'], mapping.inputs['Vector'])
+                        node_tree.links.new(mapping.outputs['Vector'], env_tex.inputs['Vector'])
+                        node_tree.links.new(env_tex.outputs['Color'], background.inputs['Color'])
+                        node_tree.links.new(background.outputs['Background'], output.inputs['Surface'])
+
+                        # Set as active world
+                        bpy.context.scene.world = world
 
                         # Clean up temporary file safely
                         try:
@@ -688,7 +718,7 @@ class BlenderMCPServer:
                                 # Use NamedTemporaryFile like we do for HDRIs
                                 with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                                     # Download the file
-                                    response = requests.get(file_url, headers=REQ_HEADERS)
+                                    response = requests.get(file_url, headers=REQ_HEADERS, timeout=30)
                                     if response.status_code == 200:
                                         tmp_file.write(response.content)
                                         tmp_path = tmp_file.name
@@ -718,7 +748,80 @@ class BlenderMCPServer:
                     if not downloaded_maps:
                         return {"error": f"No texture maps found for the requested resolution and format"}
 
-                    # ... (rest of the material creation logic)
+                    # Create a new material with the downloaded textures
+                    mat = bpy.data.materials.new(name=asset_id)
+                    mat.use_nodes = True
+                    nodes = mat.node_tree.nodes
+                    links = mat.node_tree.links
+
+                    # Clear default nodes
+                    for node in nodes:
+                        nodes.remove(node)
+
+                    # Create output node
+                    output = nodes.new(type='ShaderNodeOutputMaterial')
+                    output.location = (300, 0)
+
+                    # Create principled BSDF node
+                    principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+                    principled.location = (0, 0)
+                    links.new(principled.outputs[0], output.inputs[0])
+
+                    # Add texture nodes based on available maps
+                    tex_coord = nodes.new(type='ShaderNodeTexCoord')
+                    tex_coord.location = (-800, 0)
+
+                    mapping = nodes.new(type='ShaderNodeMapping')
+                    mapping.location = (-600, 0)
+                    mapping.vector_type = 'TEXTURE'
+                    links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
+
+                    # Position offset for texture nodes
+                    x_pos = -400
+                    y_pos = 300
+
+                    # Connect different texture maps
+                    for map_type, image in downloaded_maps.items():
+                        tex_node = nodes.new(type='ShaderNodeTexImage')
+                        tex_node.location = (x_pos, y_pos)
+                        tex_node.image = image
+
+                        # Set color space based on map type
+                        if map_type.lower() in ['color', 'diffuse', 'albedo']:
+                            try:
+                                tex_node.image.colorspace_settings.name = 'sRGB'
+                            except:
+                                pass
+                        else:
+                            try:
+                                tex_node.image.colorspace_settings.name = 'Non-Color'
+                            except:
+                                pass
+
+                        links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
+
+                        # Connect to appropriate input on Principled BSDF
+                        if map_type.lower() in ['color', 'diffuse', 'albedo']:
+                            links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
+                        elif map_type.lower() in ['roughness', 'rough']:
+                            links.new(tex_node.outputs['Color'], principled.inputs['Roughness'])
+                        elif map_type.lower() in ['metallic', 'metalness', 'metal']:
+                            links.new(tex_node.outputs['Color'], principled.inputs['Metallic'])
+                        elif map_type.lower() in ['normal', 'nor']:
+                            # Add normal map node
+                            normal_map = nodes.new(type='ShaderNodeNormalMap')
+                            normal_map.location = (x_pos + 200, y_pos)
+                            links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
+                            links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
+                        elif map_type in ['displacement', 'disp', 'height']:
+                            # Add displacement node
+                            disp_node = nodes.new(type='ShaderNodeDisplacement')
+                            disp_node.location = (x_pos + 200, y_pos - 200)
+                            links.new(tex_node.outputs['Color'], disp_node.inputs['Height'])
+                            links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
+
+                        y_pos -= 250
+
                     return {
                         "success": True,
                         "message": f"Texture {asset_id} imported as material",
@@ -752,7 +855,7 @@ class BlenderMCPServer:
                         main_file_name = file_url.split("/")[-1]
                         main_file_path = os.path.join(temp_dir, main_file_name)
 
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=30)
                         if response.status_code != 200:
                             return {"error": f"Failed to download model: {response.status_code}"}
 
@@ -770,7 +873,7 @@ class BlenderMCPServer:
                                 os.makedirs(os.path.dirname(include_file_path), exist_ok=True)
 
                                 # Download the included file
-                                include_response = requests.get(include_url, headers=REQ_HEADERS)
+                                include_response = requests.get(include_url, headers=REQ_HEADERS, timeout=30)
                                 if include_response.status_code == 200:
                                     with open(include_file_path, "wb") as f:
                                         f.write(include_response.content)
@@ -1215,7 +1318,8 @@ class BlenderMCPServer:
                 headers={
                     "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
                 },
-                files=files
+                files=files,
+                timeout=30
             )
             data = response.json()
             return data
@@ -1244,7 +1348,8 @@ class BlenderMCPServer:
                     "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
                     "Content-Type": "application/json",
                 },
-                json=req_data
+                json=req_data,
+                timeout=30
             )
             data = response.json()
             return data
@@ -1270,6 +1375,7 @@ class BlenderMCPServer:
             json={
                 "subscription_key": subscription_key,
             },
+            timeout=30
         )
         data = response.json()
         return {
@@ -1283,6 +1389,7 @@ class BlenderMCPServer:
             headers={
                 "Authorization": f"KEY {bpy.context.scene.blendermcp_hyper3d_api_key}",
             },
+            timeout=30
         )
         data = response.json()
         return data
@@ -1363,7 +1470,8 @@ class BlenderMCPServer:
             },
             json={
                 'task_uuid': task_uuid
-            }
+            },
+            timeout=30
         )
         data_ = response.json()
         temp_file = None
@@ -1377,7 +1485,7 @@ class BlenderMCPServer:
 
                 try:
                     # Download the content
-                    response = requests.get(i["url"], stream=True)
+                    response = requests.get(i["url"], stream=True, timeout=30)
                     response.raise_for_status()  # Raise an exception for HTTP errors
 
                     # Write the content to the temporary file
@@ -1426,7 +1534,8 @@ class BlenderMCPServer:
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}",
             headers={
                 "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
-            }
+            },
+            timeout=30
         )
         data_ = response.json()
         temp_file = None
@@ -1439,7 +1548,7 @@ class BlenderMCPServer:
 
         try:
             # Download the content
-            response = requests.get(data_["model_mesh"]["url"], stream=True)
+            response = requests.get(data_["model_mesh"]["url"], stream=True, timeout=30)
             response.raise_for_status()  # Raise an exception for HTTP errors
 
             # Write the content to the temporary file
@@ -1491,11 +1600,10 @@ class BlenderMCPServer:
                 headers = {
                     "Authorization": f"Token {api_key}"
                 }
-
                 response = requests.get(
                     "https://api.sketchfab.com/v3/me",
                     headers=headers,
-                    timeout=30  # Add timeout of 30 seconds
+                    timeout=30
                 )
 
                 if response.status_code == 200:
@@ -2110,7 +2218,8 @@ class BlenderMCPServer:
             response = requests.post(
                 endpoint,
                 headers = headers,
-                data = json.dumps(data)
+                data = json.dumps(data),
+                timeout=30
             )
 
             if response.status_code == 200:
@@ -2150,51 +2259,68 @@ class BlenderMCPServer:
             if text_prompt:
                 data["text"] = text_prompt
 
-            # Handling image
-            if image:
-                if re.match(r'^https?://', image, re.IGNORECASE) is not None:
-                    try:
-                        resImg = requests.get(image)
-                        resImg.raise_for_status()
-                        image_base64 = base64.b64encode(resImg.content).decode("ascii")
-                        data["image"] = image_base64
-                    except Exception as e:
-                        return {"error": f"Failed to download or encode image: {str(e)}"} 
-                else:
-                    try:
-                        # Convert to Base64 format
-                        with open(image, "rb") as f:
-                            image_base64 = base64.b64encode(f.read()).decode("ascii")
-                        data["image"] = image_base64
-                    except Exception as e:
-                        return {"error": f"Image encoding failed: {str(e)}"}
+            # Background task to avoid freezing Blender
+            def background_task():
+                try:
+                    # Handling image
+                    image_data = None
+                    if image:
+                        if re.match(r'^https?://', image, re.IGNORECASE) is not None:
+                            try:
+                                resImg = requests.get(image, timeout=30)
+                                resImg.raise_for_status()
+                                image_data = base64.b64encode(resImg.content).decode("ascii")
+                            except Exception as e:
+                                print(f"Failed to download image: {str(e)}")
+                                return
+                        else:
+                            try:
+                                with open(image, "rb") as f:
+                                    image_data = base64.b64encode(f.read()).decode("ascii")
+                            except Exception as e:
+                                print(f"Image encoding failed: {str(e)}")
+                                return
+                    
+                    if image_data:
+                        data["image"] = image_data
 
-            response = requests.post(
-                f"{base_url}/generate",
-                json = data,
-            )
+                    # Call generation API
+                    print(f"Starting Hunyuan3D generation at {base_url}...")
+                    response = requests.post(
+                        f"{base_url}/generate",
+                        json = data,
+                        timeout=600  # Longer timeout for generation
+                    )
 
-            if response.status_code != 200:
-                return {
-                    "error": f"Generation failed: {response.text}"
-                }
-        
-            # Decode base64 and save to temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as temp_file:
-                temp_file.write(response.content)
-                temp_file_name = temp_file.name
+                    if response.status_code != 200:
+                        print(f"Generation failed: {response.text}")
+                        return
+                
+                    # Decode base64 and save to temporary file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as temp_file:
+                        temp_file.write(response.content)
+                        temp_file_name = temp_file.name
 
-            # Import the GLB file in the main thread
-            def import_handler():
-                bpy.ops.import_scene.gltf(filepath=temp_file_name)
-                os.unlink(temp_file.name)
-                return None
-            
-            bpy.app.timers.register(import_handler)
+                    # Import the GLB file in the main thread
+                    def import_handler():
+                        try:
+                            bpy.ops.import_scene.gltf(filepath=temp_file_name)
+                            print("Hunyuan3D model imported successfully")
+                        finally:
+                            if os.path.exists(temp_file_name):
+                                os.unlink(temp_file_name)
+                        return None
+                    
+                    bpy.app.timers.register(import_handler)
+                except Exception as e:
+                    print(f"Error in Hunyuan3D background task: {str(e)}")
+
+            # Start the background thread
+            threading.Thread(target=background_task, daemon=True).start()
 
             return {
-                "status": "DONE",
-                "message": "Generation and Import glb succeeded"
+                "status": "QUEUED",
+                "message": "Hunyuan3D generation started in background. The model will appear in the scene once finished."
             }
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -2237,7 +2363,8 @@ class BlenderMCPServer:
             response = requests.post(
                 endpoint,
                 headers=headers,
-                data=json.dumps(data)
+                data=json.dumps(data),
+                timeout=30
             )
 
             if response.status_code == 200:
@@ -2267,7 +2394,7 @@ class BlenderMCPServer:
 
         try:
             # Download ZIP file
-            zip_response = requests.get(zip_file_url, stream=True)
+            zip_response = requests.get(zip_file_url, stream=True, timeout=30)
             zip_response.raise_for_status()
             with open(zip_file_path, "wb") as f:
                 for chunk in zip_response.iter_content(chunk_size=8192):
