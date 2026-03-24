@@ -128,6 +128,7 @@ class BlenderMCPServer:
         print("Client handler started")
         client.settimeout(None)  # No timeout
         buffer = b''
+        decoder = json.JSONDecoder()
 
         try:
             while self.running:
@@ -139,38 +140,51 @@ class BlenderMCPServer:
                         break
 
                     buffer += data
-                    try:
-                        # Try to parse command
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
+                    
+                    while buffer:
+                        try:
+                            # Try to parse one JSON object
+                            decoded = buffer.decode('utf-8')
+                            command, index = decoder.raw_decode(decoded)
+                            
+                            # Success! Prepare remaining buffer for next iteration
+                            # We must re-encode to bytes because index is in characters
+                            buffer = decoded[index:].encode('utf-8').lstrip()
 
-                        # Execute command in Blender's main thread
-                        def execute_wrapper():
-                            try:
-                                response = self.execute_command(command)
-                                response_json = json.dumps(response)
-                                try:
-                                    client.sendall(response_json.encode('utf-8'))
-                                except:
-                                    print("Failed to send response - client disconnected")
-                            except Exception as e:
-                                print(f"Error executing command: {str(e)}")
-                                traceback.print_exc()
-                                try:
-                                    error_response = {
-                                        "status": "error",
-                                        "message": str(e)
-                                    }
-                                    client.sendall(json.dumps(error_response).encode('utf-8'))
-                                except:
-                                    pass
-                            return None
+                            # Execute command in Blender's main thread
+                            def make_execute_wrapper(cmd):
+                                def execute_wrapper():
+                                    try:
+                                        response = self.execute_command(cmd)
+                                        response_json = json.dumps(response)
+                                        try:
+                                            client.sendall(response_json.encode('utf-8'))
+                                        except:
+                                            print("Failed to send response - client disconnected")
+                                    except Exception as e:
+                                        print(f"Error executing command: {str(e)}")
+                                        traceback.print_exc()
+                                        try:
+                                            error_response = {
+                                                "status": "error",
+                                                "message": str(e)
+                                            }
+                                            client.sendall(json.dumps(error_response).encode('utf-8'))
+                                        except:
+                                            pass
+                                    return None
+                                return execute_wrapper
 
-                        # Schedule execution in main thread
-                        bpy.app.timers.register(execute_wrapper, first_interval=0.0)
-                    except json.JSONDecodeError:
-                        # Incomplete data, wait for more
-                        pass
+                            # Schedule execution in main thread
+                            bpy.app.timers.register(make_execute_wrapper(command), first_interval=0.0)
+                            
+                        except json.JSONDecodeError:
+                            # Incomplete data, wait for more
+                            break
+                        except UnicodeDecodeError:
+                            # Partial character at the end, wait for more
+                            break
+                            
                 except Exception as e:
                     print(f"Error receiving data: {str(e)}")
                     break
