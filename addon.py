@@ -129,6 +129,45 @@ class BlenderMCPServer:
         client.settimeout(None)  # No timeout
         buffer = b''
         decoder = json.JSONDecoder()
+        
+        # Queue for sequential command processing
+        command_queue = []
+        is_processing = [False] # Use a list to make it mutable in the closure
+
+        def process_next_command():
+            if not command_queue:
+                is_processing[0] = False
+                return None
+            
+            is_processing[0] = True
+            cmd = command_queue.pop(0)
+            
+            try:
+                # Execute command in Blender's main thread
+                response = self.execute_command(cmd)
+                response_json = json.dumps(response)
+                try:
+                    client.sendall(response_json.encode('utf-8'))
+                except:
+                    print("Failed to send response - client disconnected")
+            except Exception as e:
+                print(f"Error executing command: {str(e)}")
+                traceback.print_exc()
+                try:
+                    error_response = {
+                        "status": "error",
+                        "message": str(e)
+                    }
+                    client.sendall(json.dumps(error_response).encode('utf-8'))
+                except:
+                    pass
+            
+            # Schedule next command processing
+            if command_queue:
+                return 0.0
+            else:
+                is_processing[0] = False
+                return None
 
         try:
             while self.running:
@@ -148,35 +187,13 @@ class BlenderMCPServer:
                             command, index = decoder.raw_decode(decoded)
                             
                             # Success! Prepare remaining buffer for next iteration
-                            # We must re-encode to bytes because index is in characters
                             buffer = decoded[index:].encode('utf-8').lstrip()
 
-                            # Execute command in Blender's main thread
-                            def make_execute_wrapper(cmd):
-                                def execute_wrapper():
-                                    try:
-                                        response = self.execute_command(cmd)
-                                        response_json = json.dumps(response)
-                                        try:
-                                            client.sendall(response_json.encode('utf-8'))
-                                        except:
-                                            print("Failed to send response - client disconnected")
-                                    except Exception as e:
-                                        print(f"Error executing command: {str(e)}")
-                                        traceback.print_exc()
-                                        try:
-                                            error_response = {
-                                                "status": "error",
-                                                "message": str(e)
-                                            }
-                                            client.sendall(json.dumps(error_response).encode('utf-8'))
-                                        except:
-                                            pass
-                                    return None
-                                return execute_wrapper
-
-                            # Schedule execution in main thread
-                            bpy.app.timers.register(make_execute_wrapper(command), first_interval=0.0)
+                            # Add to queue and trigger processing if not already running
+                            command_queue.append(command)
+                            if not is_processing[0]:
+                                is_processing[0] = True
+                                bpy.app.timers.register(process_next_command, first_interval=0.0)
                             
                         except json.JSONDecodeError:
                             # Incomplete data, wait for more
