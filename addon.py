@@ -133,14 +133,16 @@ class BlenderMCPServer:
         # Queue for sequential command processing
         command_queue = []
         is_processing = [False] # Use a list to make it mutable in the closure
+        queue_lock = threading.Lock()
 
         def process_next_command():
-            if not command_queue:
-                is_processing[0] = False
-                return None
-            
-            is_processing[0] = True
-            cmd = command_queue.pop(0)
+            with queue_lock:
+                if not command_queue:
+                    is_processing[0] = False
+                    return None
+                
+                is_processing[0] = True
+                cmd = command_queue.pop(0)
             
             try:
                 # Execute command in Blender's main thread
@@ -162,12 +164,13 @@ class BlenderMCPServer:
                 except:
                     pass
             
-            # Schedule next command processing
-            if command_queue:
-                return 0.0
-            else:
-                is_processing[0] = False
-                return None
+            with queue_lock:
+                # Schedule next command processing
+                if command_queue:
+                    return 0.0
+                else:
+                    is_processing[0] = False
+                    return None
 
         try:
             while self.running:
@@ -181,6 +184,7 @@ class BlenderMCPServer:
                     buffer += data
                     
                     while buffer:
+                        decoded = None
                         try:
                             # Try to parse one JSON object
                             decoded = buffer.decode('utf-8')
@@ -189,18 +193,56 @@ class BlenderMCPServer:
                             # Success! Prepare remaining buffer for next iteration
                             buffer = decoded[index:].encode('utf-8').lstrip()
 
-                            # Add to queue and trigger processing if not already running
-                            command_queue.append(command)
-                            if not is_processing[0]:
-                                is_processing[0] = True
+                            should_start = False
+                            with queue_lock:
+                                # Add to queue and trigger processing if not already running
+                                command_queue.append(command)
+                                if not is_processing[0]:
+                                    is_processing[0] = True
+                                    should_start = True
+                            
+                            if should_start:
                                 bpy.app.timers.register(process_next_command, first_interval=0.0)
                             
-                        except json.JSONDecodeError:
-                            # Incomplete data, wait for more
+                        except json.JSONDecodeError as exc:
+                            # Differentiate between incomplete frames and malformed input
+                            if decoded is not None:
+                                is_incomplete = (
+                                    exc.pos == len(decoded)
+                                    or exc.msg.startswith("Unterminated string")
+                                    or exc.msg.startswith("Expecting value")
+                                )
+                                if is_incomplete:
+                                    # Incomplete JSON, wait for more data
+                                    break
+                                
+                                # Malformed JSON
+                                print(f"Malformed JSON received: {str(exc)}")
+                                try:
+                                    error_response = {"status": "error", "message": f"Invalid JSON command: {exc.msg}"}
+                                    client.sendall(json.dumps(error_response).encode('utf-8'))
+                                except:
+                                    pass
+                                # Clear buffer to recover or break to close connection
+                                buffer = b''
+                                return
                             break
-                        except UnicodeDecodeError:
-                            # Partial character at the end, wait for more
-                            break
+                        except UnicodeDecodeError as exc:
+                            if exc.reason == "unexpected end of data":
+                                # Partial UTF-8 sequence at the buffer end
+                                break
+                            
+                            print("Invalid UTF-8 in command stream")
+                            try:
+                                error_response = {"status": "error", "message": "Invalid UTF-8 in command stream"}
+                                client.sendall(json.dumps(error_response).encode('utf-8'))
+                            except:
+                                pass
+                            return
+                            
+                except Exception as e:
+                    print(f"Error receiving data: {str(e)}")
+                    break
                             
                 except Exception as e:
                     print(f"Error receiving data: {str(e)}")
