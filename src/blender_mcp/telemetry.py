@@ -172,10 +172,10 @@ class TelemetryCollector:
 
     def _check_user_consent(self) -> bool:
         """Check if user has consented to prompt collection via Blender addon"""
-        # Return cached consent if it's still fresh
+        # Return cached consent only if it's False (privacy first)
         now = time.time()
-        if self._consent_cache is not None and (now - self._last_consent_check) < self._consent_check_interval:
-            return self._consent_cache
+        if self._consent_cache == False and (now - self._last_consent_check) < self._consent_check_interval:
+            return False
 
         try:
             # Import here to avoid circular dependency
@@ -183,18 +183,16 @@ class TelemetryCollector:
             blender = get_blender_connection()
             result = blender.send_command("get_telemetry_consent", {})
             consent = result.get("consent", False)
-            
-            # Update cache
-            self._consent_cache = consent
+
+            # Update cache: Only cache if False to ensure privacy is respected immediately
+            self._consent_cache = False if not consent else None
             self._last_consent_check = now
             return consent
         except Exception as e:
-            # If we already have a cached value, keep using it on error
-            if self._consent_cache is not None:
-                return self._consent_cache
-            # Default to False if we can't check
+            # Consent checks should fail closed on error
+            self._consent_cache = False
+            self._last_consent_check = now
             return False
-
     def record_event(
         self,
         event_type: EventType,
