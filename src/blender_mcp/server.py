@@ -62,10 +62,9 @@ class BlenderConnection:
                 self._last_verified = 0
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive exactly one full JSON object response"""
+        """Memory-efficient JSON response receiver for large Blender payloads"""
         chunks = []
         sock.settimeout(180.0)
-        
         decoder = json.JSONDecoder()
         
         try:
@@ -73,32 +72,33 @@ class BlenderConnection:
                 chunk = sock.recv(buffer_size)
                 if not chunk:
                     if not chunks:
-                        raise Exception("Connection closed before receiving any data")
+                        raise Exception("Connection closed before receiving data")
                     break
                 
                 chunks.append(chunk)
                 
-                try:
-                    data = b''.join(chunks)
-                    decoded = data.decode('utf-8')
-                    
+                # Only attempt decode if the chunk looks like a possible JSON end to avoid N^2 overhead
+                if chunk.rstrip().endswith(b'}'):
                     try:
-                        # raw_decode returns the object and the index where it ended
-                        obj, index = decoder.raw_decode(decoded)
-                        # We return only the part that belongs to this JSON object
-                        return decoded[:index].encode('utf-8')
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
+                        data = b''.join(chunks)
+                        decoded = data.decode('utf-8')
+                        try:
+                            # raw_decode returns the object and the index where it ended
+                            obj, index = decoder.raw_decode(decoded)
+                            # We return only the part that belongs to this JSON object
+                            return decoded[:index].encode('utf-8')
+                        except json.JSONDecodeError:
+                            # Incomplete JSON, continue receiving
+                            continue
+                    except UnicodeDecodeError:
+                        # Partial UTF-8 sequence, continue receiving
                         continue
-                except UnicodeDecodeError:
-                    # Partial UTF-8 sequence, continue receiving
-                    continue
                     
             if chunks:
                 return b''.join(chunks)
-            raise Exception("No data received")
+            raise Exception("No data received from Blender")
         except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
+            logger.error(f"Error receiving data from Blender: {str(e)}")
             raise
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -339,7 +339,10 @@ def execute_blender_code(ctx: Context, code: str) -> str:
         # Get the global connection
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        if result.get("executed"):
+            return f"Code executed successfully: {result.get('result', '')}"
+        else:
+            return f"Code execution failed: {result.get('error', 'Unknown error')}"
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
